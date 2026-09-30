@@ -38,6 +38,10 @@ For Buildbarn upstream background, see https://github.com/buildbarn.
   - [Reads are open by design](#reads-are-open-by-design)
   - [CAS read efficiency](#cas-read-efficiency)
 - [Frontend Read Cache](#frontend-read-cache)
+  - [Where the volume lives](#where-the-volume-lives)
+  - [Always set an ephemeral-storage request](#always-set-an-ephemeral-storage-request)
+  - [Sizing the key-location map](#sizing-the-key-location-map)
+  - [Verifying it](#verifying-it)
 - [JWKS ConfigMap Management](#jwks-configmap-management)
 - [Tracing, Metrics, And Diagnostics](#tracing-metrics-and-diagnostics)
 - [Frontend Autoscaling](#frontend-autoscaling)
@@ -46,14 +50,12 @@ For Buildbarn upstream background, see https://github.com/buildbarn.
 - [Worker And Runner](#worker-and-runner)
 - [Worker Autoscaling](#worker-autoscaling)
 - [Testcontainers Worker Fleets](#testcontainers-worker-fleets)
-  - [DinD Fleet](#dind-fleet)
-  - [Sysbox Fleet](#sysbox-fleet)
-  - [Routing](#routing)
   - [Node Pool Prerequisites](#node-pool-prerequisites)
-  - [Operational notes](#operational-notes)
 - [Action Routing And Catch-All Workers](#action-routing-and-catch-all-workers)
 - [Security And Availability Hardening](#security-and-availability-hardening)
   - [Restricting direct storage access](#restricting-direct-storage-access)
+  - [Restricting direct scheduler access](#restricting-direct-scheduler-access)
+  - [Locking down the rest](#locking-down-the-rest)
 - [Scheduling](#scheduling)
 - [Verification](#verification)
 - [Hermetiq grpc-cache-proxy sidecar](#hermetiq-grpc-cache-proxy-sidecar)
@@ -68,7 +70,7 @@ For Buildbarn upstream background, see https://github.com/buildbarn.
 Core resources:
 
 - `buildbarn-config` ConfigMap for browser, frontend, scheduler, storage, and remote asset Jsonnet.
-- `buildbarn-worker-config` ConfigMap for worker and runner Jsonnet, available to operator-managed or legacy chart-managed workers.
+- `buildbarn-worker-config` ConfigMap containing shared `common.libsonnet` for operator-managed workers.
 - `browser` Deployment and Service.
 - `frontend` Deployment plus `frontend-grpc` Service.
 - Optional KEDA `ScaledObject` for the frontend Deployment.
@@ -77,9 +79,7 @@ Core resources:
 - Optional `bb-portal` Deployment and Service when `portal.enabled=true` (see [bb-portal](#bb-portal)).
 - Optional `frontend-internal` ClusterIP Service for trusted in-cluster clients when `frontend.internalService.enabled=true`.
 - Optional `NetworkPolicy` restricting the storage gRPC port to Buildbarn components and named peers when `storage.networkPolicy.enabled=true`.
-- Optional legacy `worker-ubuntu22-04` Deployment and matching KEDA `ScaledObject` when `workerUbuntu2204.enabled=true`.
-- Optional `worker-testcontainers` Deployment (with a Docker-in-Docker sidecar) and matching KEDA `ScaledObject` for Bazel actions that need a Docker daemon.
-- Optional `worker-testcontainers-sysbox` Deployment and matching KEDA `ScaledObject` for Bazel actions that need Docker inside a Sysbox runtime.
+- Optional `NetworkPolicy` restricting the scheduler's client, worker, and BuildQueueState ports to the frontend, workers, bb-portal, and named peers when `scheduler.networkPolicy.enabled=true`.
 - Optional `remote-asset` Deployment plus `remote-asset` and `remote-asset-grpc` Services.
 - Optional PodDisruptionBudgets for storage, frontend, scheduler, Browser, and remote asset workloads.
 - Optional cert-manager `Certificate` for Contour or Ingress routing.
@@ -87,38 +87,48 @@ Core resources:
 - Optional VictoriaMetrics `VMPodScrape` and `VMRule` resources.
 - Optional JWKS sync ServiceAccount, RBAC, CronJob, and initial sync Job.
 
-Worker pools are expected to be managed by the Buildbarn Worker operator by
-default. Set `workerUbuntu2204.enabled=true` only when you intentionally want
-this chart to keep rendering the legacy Ubuntu 22.04 worker Deployment.
-`worker-testcontainers` and `worker-testcontainers-sysbox` remain opt-in
-chart-managed fleets for tests/actions that need Docker (see
-[Testcontainers worker fleets](#testcontainers-worker-fleets)).
+Worker pools are managed through `RbeWorker` resources reconciled by the
+[bb-worker-operator](../bb-worker-operator/README.md). This chart does not
+render worker Deployments or worker KEDA `ScaledObject` resources.
 
 ## Install
 
-```bash
-helm upgrade --install --namespace hermetiq buildbarn \
-  oci://ghcr.io/hermetiq/buildbarn \
-  --version 0.9.4 \
-  --values buildbarn-values.yaml
-```
+Start with the
+[Buildbarn starter values](https://github.com/Hermetiq/hermetiq-k8s/blob/main/custom-values/buildbarn-values.yaml),
+copied to `my-custom-values/buildbarn-values.yaml` as described in the
+[repository setup guide](https://github.com/Hermetiq/hermetiq-k8s#prepare-custom-values).
 
-By default, namespaced resources render into `hermetiq`:
-
-```yaml
-namespaceOverride: hermetiq
-createNamespace: false
-```
-
-Set `createNamespace: true` if Helm should create that namespace, or override
-`namespaceOverride` to render into a different namespace.
-
-Inspect the packaged documentation and defaults before creating overrides:
+Inspect the packaged documentation and defaults before editing Buildbarn
+values:
 
 ```bash
 helm show readme oci://ghcr.io/hermetiq/buildbarn --version 0.9.4
 helm show values oci://ghcr.io/hermetiq/buildbarn --version 0.9.4
 ```
+
+Set the hosts, identity provider, storage sizing, and routing for your cluster.
+After the Hermetiq chart and worker operator are installed, install Buildbarn:
+
+```bash
+helm upgrade --install --namespace hermetiq buildbarn \
+  oci://ghcr.io/hermetiq/buildbarn \
+  --version 0.9.4 \
+  --values my-custom-values/buildbarn-values.yaml
+```
+
+Check [Buildbarn readiness](#verification), then follow the
+[RBE worker pool instructions](https://github.com/Hermetiq/hermetiq-k8s/blob/main/custom-values/rbeworkers/README.md)
+to apply the worker manifests.
+
+Namespaced resources render into the release namespace (`--namespace`):
+
+```yaml
+namespaceOverride: ""
+createNamespace: false
+```
+
+Set `namespaceOverride` to render into a different namespace, and
+`createNamespace: true` if Helm should create it.
 
 Contributors can render the checked-out chart locally:
 
@@ -164,11 +174,17 @@ Set `hosts.browser`, `hosts.frontendGrpc`, `hosts.rbeWeb`, `hosts.remoteAsset`,
 Buildbarn itself is configured through Jsonnet. The chart renders two ConfigMaps:
 
 - `buildbarn-config` from the chart's `files/config/` directory.
-- `buildbarn-worker-config` from the chart's `files/worker-config/` directory.
+- `buildbarn-worker-config` with the shared `common.libsonnet`.
 
-`buildbarn-worker-config` also includes the top-level `common.libsonnet`, so
-worker and runner configs use the same sharded storage, message size, tracing,
-and diagnostics defaults as the rest of the chart.
+The operator combines that shared file with the worker and runner Jsonnet it
+generates for each `RbeWorker`, so workers use the chart's sharded storage and
+message size settings.
+
+The chart hashes the generated Jsonnet files into the Pod templates that use
+them, so changing those files or their values in a Helm upgrade rolls the
+affected Buildbarn Deployments and StatefulSet. `RbeWorker` pools use
+`spec.config.rolloutOnChange: true` in the starter manifests to roll when
+their mounted shared ConfigMap changes.
 
 Some Jsonnet files are Helm-templated before landing in the ConfigMap. For
 example:
@@ -176,24 +192,24 @@ example:
 - `common.libsonnet` renders storage shard addresses and tracing settings.
 - `frontend.jsonnet` renders JWKS auth, CAS/Action Cache/Execute authorizers, read cache settings, and trace attributes.
 - `storage.jsonnet` renders persistence sizing.
-- `worker-common.libsonnet` renders worker concurrency, caches, platform properties, completed action logging, and runner options.
+- The worker operator generates worker concurrency, caches, platform properties,
+  completed action logging, and runner options from each `RbeWorker`.
 - `asset.jsonnet` renders Remote Asset API port and fetch/push behavior.
 
 ## Per-File Jsonnet Overrides
 
-Use `configOverrides` or `workerConfigOverrides` when a value is too specific or
-too deep for the chart values model:
+Use `configOverrides` when a value is too specific or too deep for the chart
+values model:
 
 ```bash
 helm upgrade --install --namespace hermetiq buildbarn \
   oci://ghcr.io/hermetiq/buildbarn \
   --version 0.9.4 \
-  --values buildbarn-values.yaml \
-  --set-file 'configOverrides.frontend\.jsonnet'=./my-frontend.jsonnet \
-  --set-file 'workerConfigOverrides.worker-ubuntu22-04\.jsonnet'=./my-worker.jsonnet
+  --values my-custom-values/buildbarn-values.yaml \
+  --set-file 'configOverrides.frontend\.jsonnet'=./my-frontend.jsonnet
 ```
 
-Keys must match a filename in `files/config/` or `files/worker-config/`.
+Keys must match a filename in `files/config/`.
 Unknown keys fail `helm template` with the valid filenames.
 
 Overrides are verbatim. Helm templating is not applied to override contents, so
@@ -211,14 +227,6 @@ Override-able files:
 | `configOverrides` | `scheduler.jsonnet` |
 | `configOverrides` | `portal.jsonnet` |
 | `configOverrides` | `storage.jsonnet` |
-| `workerConfigOverrides` | `runner-testcontainers-sysbox.jsonnet` |
-| `workerConfigOverrides` | `runner-testcontainers.jsonnet` |
-| `workerConfigOverrides` | `runner-ubuntu22-04.jsonnet` |
-| `workerConfigOverrides` | `worker-common.libsonnet` |
-| `workerConfigOverrides` | `worker-testcontainers-sysbox.jsonnet` |
-| `workerConfigOverrides` | `worker-testcontainers.jsonnet` |
-| `workerConfigOverrides` | `worker-ubuntu22-04.jsonnet` |
-
 `configOverrides.common.libsonnet` propagates to both ConfigMaps.
 
 ## Routing And TLS
@@ -330,6 +338,8 @@ truncate them.
 `gateway.clientTrafficPolicy` renders an Envoy Gateway `ClientTrafficPolicy`
 (`routing.provider=gateway` only) covering the client → Envoy leg. It is
 disabled by default; enable it when Bazel clients are far from the cluster.
+When enabled, it advertises `h2` for gRPC and `http/1.1` for browser traffic
+through `spec.tls.alpnProtocols` on TLS listeners.
 
 > **Installing the hermetiq chart too?** Enable it there instead. The policy is
 > Gateway-scoped, so one covers both charts' routes, and `ClientTrafficPolicy`
@@ -382,11 +392,13 @@ optional Remote Asset hostnames.
 
 `certificate.enabled` defaults to `true` and `certificate.issuerRef.name`
 defaults to `lets-encrypt-issuer`, so a Contour or Ingress install renders a
-`bb-wildcard-cert` Certificate unless you act. Point `certificate.issuerRef` at
-a `ClusterIssuer` that exists in your cluster, set `tls.secretName` to reuse a
-wildcard Secret you already manage, or set `certificate.enabled: false`. If the
-referenced issuer does not exist, the Certificate stays pending and the routes
-serve no usable TLS.
+`bb-wildcard-cert` Certificate unless you act. Install cert-manager in the
+cluster and point `certificate.issuerRef` at an existing issuer (`ClusterIssuer`
+by default) before using chart-managed TLS. Alternatively, set
+`tls.secretName` to reuse a wildcard Secret you already manage, or set
+`certificate.enabled: false` and
+manage the route TLS Secrets yourself. If the referenced issuer does not
+exist, the Certificate stays pending and the routes serve no usable TLS.
 
 ## In-Cluster Mutual TLS
 
@@ -438,8 +450,10 @@ however this block is configured. The runner is reached over
 
 ### The certificate
 
-One Secret serves every pod, as both server and client. cert-manager writes
-`tls.crt`, `tls.key` and `ca.crt` into one Secret, which is why
+One Secret serves every pod, as both server and client. If cert-manager manages
+this Secret, install it and configure an issuer and a separate `Certificate`
+resource for the in-cluster names; this chart does not create that Certificate.
+cert-manager writes `tls.crt`, `tls.key` and `ca.crt` into one Secret, which is why
 `certificateAuthoritiesFile` can point back into the same mount. Its SANs must
 cover every in-cluster name the chart dials, or the peer rejects it by name
 rather than by CA:
@@ -484,9 +498,15 @@ is a `string`, unlike the authorizer `deny` used elsewhere in these files.
 
 ### Operator-managed workers
 
-`RbeWorker` pods consume the chart's `buildbarn-worker-config` ConfigMap, so
-they pick up the client half automatically — but the chart does not own their
-pod spec, so the Secret is not mounted for them. Add it on each `RbeWorker`:
+`RbeWorker` pods consume the chart's `buildbarn-worker-config` ConfigMap. Its
+shared `common.libsonnet` includes storage client TLS, but the operator's
+generated worker config uses a plaintext scheduler connection by default.
+When enabling `security.grpcMtls`, provide worker-side Jsonnet on each
+`RbeWorker` that also configures scheduler client TLS. With generated config,
+this means supplying a compatible `worker-common.libsonnet` in a
+customer-managed ConfigMap alongside `common.libsonnet`, then pointing
+`spec.config.generated.commonConfigMapName` and `commonItems` to those files.
+Mount the certificate Secret on each `RbeWorker`:
 
 ```yaml
 spec:
@@ -500,8 +520,8 @@ spec:
       mountPath: /etc/buildbarn/mtls
 ```
 
-Without it those workers start, fail to present a certificate, and are refused
-by the scheduler and storage.
+Without both the custom worker config and the Secret mount, workers cannot
+connect to mTLS-protected scheduler and storage endpoints.
 
 ### Overrides
 
@@ -509,10 +529,10 @@ A `configOverrides` entry is spliced in verbatim with no templating, so a
 forked file carries none of the blocks above. Overriding one end of a hop while
 the other end starts demanding a client certificate is how a cluster stops
 talking to itself on upgrade, so the chart refuses the combination for
-`common.libsonnet`, `storage.jsonnet`, `frontend.jsonnet`, `portal.jsonnet` and
-`workerConfigOverrides["worker-common.libsonnet"]` rather than letting it fail
-at runtime. Add the `tls` blocks to your override, or leave `security.grpcMtls`
-off.
+`common.libsonnet`, `storage.jsonnet`, `frontend.jsonnet`, and `portal.jsonnet`
+rather than letting it fail at runtime. Add the `tls` blocks to your override,
+or leave `security.grpcMtls` off. Worker-specific Jsonnet is configured on the
+`RbeWorker` resource.
 
 ## Storage
 
@@ -936,6 +956,19 @@ browser:
 
 If `browser.oauth2Proxy.client.existingSecret` is empty, the chart renders an
 `oauth2-proxy-client` Secret from `clientId`, `clientSecret`, and `cookieSecret`.
+The chart-managed OAuth ConfigMap and Secret have Pod checksums, so changing
+their values rolls Browser. For an external ConfigMap or Secret, Helm cannot
+hash its contents. Change a `commonAnnotations` value in the Buildbarn values
+file when rotating it, then run `helm upgrade`, for example:
+
+```yaml
+commonAnnotations:
+  buildbarn.com/external-config-revision: "2026-09-30-1"
+```
+
+The changed annotation rolls Buildbarn's chart-managed workloads. A shared
+Hermetiq OAuth Secret also needs the corresponding Hermetiq rollout value
+changed for its dashboard and Grafana proxy consumers.
 
 ### Custom auth sidecar hook
 
@@ -1520,300 +1553,63 @@ you need settings the values do not expose.
 
 ## Worker And Runner
 
-By default this chart does not render the Ubuntu 22.04 worker Deployment. Install
-the `bb-worker-operator` chart and create `RbeWorker` custom resources for normal
-worker pools.
+The Buildbarn chart does not create worker Deployments or KEDA worker
+`ScaledObject` resources. Install the
+[bb-worker-operator](../bb-worker-operator/README.md#install), then create
+[`RbeWorker` pools](../../custom-values/rbeworkers/README.md) after Buildbarn
+and its `buildbarn-worker-config` ConfigMap are ready. The chart publishes only
+`common.libsonnet` in that ConfigMap; the operator generates each pool's worker
+and runner Jsonnet from its `RbeWorker` spec. Review the example
+[pod scheduling checklist](../../custom-values/rbeworkers/README.md#pod-scheduling)
+before applying the pools. Apply every `RbeWorker` in the Buildbarn release
+namespace; the example below uses `hermetiq` for both.
 
-The legacy `worker-ubuntu22-04` Deployment can still be enabled with
-`workerUbuntu2204.enabled=true`. When enabled, it runs two main containers and
-two init containers:
-
-| Container | Purpose |
-| --- | --- |
-| `worker` | Runs `bb_worker`, talks to scheduler/storage, prepares inputs, calls the local runner, uploads outputs. |
-| `runner` | Runs `/bb/bb_runner` inside the configured Ubuntu image and executes build commands. |
-| `bb-runner-installer` | Copies `bb_runner` into the shared `/bb` volume. New Buildbarn images install only `bb_runner`, not `tini`. |
-| `volume-init` | Creates `/worker/build`, `/worker/cache`, and `/storage-worker-cas/persistent_state` with the expected permissions. |
-
-The runner command is intentionally direct:
-
-```yaml
-command:
-  - /bb/bb_runner
-  - /config/runner-ubuntu22-04.jsonnet
+```bash
+kubectl apply --namespace hermetiq --kustomize my-custom-values/rbeworkers
+kubectl -n hermetiq get rbeworkers
 ```
 
-Older manifests used `/bb/tini -v -- /bb/bb_runner ...`; that no longer works
-with current `bb-runner-installer` images because `tini` is not installed.
-
-The worker and runner communicate over a Unix socket:
-
-```text
-unix:///worker/runner
-```
-
-The `worker` volume is an `emptyDir` shared by both containers. The worker uses
-`Bidirectional` mount propagation and the runner uses `HostToContainer` so FUSE
-mounts created by the worker are visible to the runner.
-
-The legacy worker also mounts:
-
-- `/dev/fuse` from the host when `workerUbuntu2204.fuse.enabled` is true.
-- `/storage-worker-cas` from a host path, usually backed by local SSD.
-- `/config` from `buildbarn-worker-config`.
-
-Key worker config values:
-
-```yaml
-workerUbuntu2204:
-  config:
-    concurrency: 11
-    inputDownloadConcurrency: 9
-    outputUploadConcurrency: 11
-    platformProperties:
-      - name: container-image
-        value: docker://ghcr.io/catthehacker/ubuntu:act-22.04
-```
-
-Bazel selects this worker pool by sending matching remote execution platform
-properties, for example through `--remote_default_exec_properties`.
-
-The worker advertises a stable worker ID using downward API ext vars:
-
-- `POD_NAME`
-- `NODE_NAME`
-
-Completed action logging is enabled by default and sends action completion data
-to `bbcal.address`.
+Set images, platform properties, concurrency, storage, scheduling, and runner
+resources on each `RbeWorker`. The starter manifests cover general Ubuntu,
+Codex, and Envoy pools. Bazel selects a pool using matching remote execution
+platform properties, such as `container-image` or `pool`.
 
 ## Worker Autoscaling
 
-When `keda.enabled` and `workerUbuntu2204.enabled` are true, the chart renders a
-KEDA `ScaledObject` for `worker-ubuntu22-04`. The scaler queries VictoriaMetrics
-for scheduled tasks minus tasks that have finished execution, which tracks
-currently queued or executing work for the worker platform properties.
+Configure worker autoscaling under `spec.autoscaling` on each `RbeWorker`. The
+operator creates and maintains the worker Deployment and KEDA `ScaledObject`.
+The Buildbarn chart's `keda.frontend` values control only frontend autoscaling.
 
-Operator-managed worker autoscaling should be configured on the `RbeWorker` custom
-resource instead. Leaving `workerUbuntu2204.enabled=false` also disables the old
-chart-managed `ScaledObject`.
-
-The chart still renders the shared `worker-vmpodscrape` when
-`vmPodScrapes.enabled=true`. Preserve the `app=worker` pod label, or update your
-own scrape configuration, so operator-managed worker metrics continue to be
-collected.
-
-Important values:
-
-```yaml
-keda:
-  enabled: true
-  prometheusServerAddress: http://vmselect-vmks.hermetiq.svc.cluster.local:8481/select/0/prometheus
-  workerUbuntu2204:
-    minReplicaCount: 0
-    maxReplicaCount: 20
-    threshold: "11"
-```
-
-With KEDA enabled, the Deployment does not render a static `replicas` field.
-With KEDA disabled, `workerUbuntu2204.replicas` controls the Deployment directly.
+The chart still renders `worker-vmpodscrape` when `vmPodScrapes.enabled=true`.
+Keep the `app=worker` label on operator-managed pods, or update your own scrape
+configuration, so worker metrics continue to be collected.
 
 ## Testcontainers Worker Fleets
 
-The chart includes two optional worker fleets for Bazel tests that need a
-Docker daemon at action-execution time (Testcontainers, container-image tests,
-etc.). Both are disabled by default and can run side by side:
-
-- `workerTestcontainers`: Docker-in-Docker sidecar, routed with `pool=testcontainers`.
-- `workerTestcontainersSysbox`: Docker inside a Sysbox runner container, routed with `pool=testcontainers-sysbox`.
-
-At a high level, both fleets present the same Docker API to the action:
-`DOCKER_HOST=unix:///var/run/docker.sock`,
-`TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock`, and
-`TESTCONTAINERS_HOST_OVERRIDE=localhost`. The difference is where that daemon
-comes from. DinD runs a privileged `docker:dind` sidecar and shares its socket
-with the runner. Sysbox starts `dockerd` inside the runner container itself,
-under Kubernetes `runtimeClassName: sysbox-runc` and `hostUsers: false`, so it
-does not need a privileged Docker sidecar or a host Docker socket.
-
-The sample Bazel workspace in the repository's
-[`examples/testcontainers/`](https://github.com/Hermetiq/hermetiq-k8s/tree/main/examples/testcontainers)
-directory demonstrates the target-side pattern: declare the Testcontainers environment variables on the
-test rule and select a worker fleet with `exec_properties`.
-
-Enable the DinD fleet with:
-
-```yaml
-workerTestcontainers:
-  enabled: true
-```
-
-Enable the Sysbox fleet with:
-
-```yaml
-images:
-  runnerTestcontainersSysbox:
-    image: <registry>/buildbarn-sysbox-runner:latest
-    pullPolicy: Always
-workerTestcontainersSysbox:
-  enabled: true
-```
-
-### DinD Fleet
-
-When `workerTestcontainers.enabled` is true, the chart renders a
-`worker-testcontainers` Deployment whose pod runs three containers — `worker`,
-`runner`, and a `dind` (Docker-in-Docker) sidecar — plus a matching KEDA
-`ScaledObject`. The `dind` sidecar runs
-`dockerd` against a shared `emptyDir` `/var/run/docker.sock`, which the
-`runner` container mounts so actions (and the Testcontainers client) can
-reach the daemon at `unix:///var/run/docker.sock`. The runner waits for the
-socket before starting `bb_runner`; test targets should still set the
-Testcontainers environment variables directly, as shown below, because Bazel's
-test wrapper does not preserve all worker-injected environment variables.
-
-### Sysbox Fleet
-
-When `workerTestcontainersSysbox.enabled` is true, the chart renders a separate
-`worker-testcontainers-sysbox` Deployment whose pod runs only `worker` and
-`runner` containers under `runtimeClassName: sysbox-runc`. It does not render a
-DinD sidecar, does not mount the host Docker socket, and does not share a
-`/var/run` Docker socket volume. The Sysbox runner image is responsible for
-including `/bb/bb_runner` and starting `dockerd` inside the runner container
-before launching `bb_runner`; unlike the regular worker fleets, the Sysbox fleet
-does not use a `bb-runner-installer` init container because the runtime class is
-applied to the whole pod.
-
-The chart does not build or publish that image. See the repository's
-[`examples/sysbox-runner-image/`](https://github.com/Hermetiq/hermetiq-k8s/tree/main/examples/sysbox-runner-image)
-for a Dockerfile and entrypoint adapted from EngFlow's Sysbox recommendation.
-
-The example image does three chart-specific things:
-
-- Installs Docker Engine and CLI.
-- Copies Buildbarn's `bb_runner` into `/bb` at image build time.
-- Starts `dockerd`, waits for `docker info`, optionally pre-pulls images from
-  `workerTestcontainersSysbox.preloadImages`, then execs `bb_runner`.
-
-Avoid application env vars with the `SYSBOX_` prefix in Sysbox pods. Sysbox
-reserves that prefix for runtime directives and rejects unknown names before the
-container starts.
-
-### Routing
-
-The DinD fleet advertises platform property `pool=testcontainers`; the Sysbox
-fleet advertises `pool=testcontainers-sysbox`. Keep the default operator-managed
-worker pool or legacy `workerUbuntu2204` fleet without a `pool` property, so:
-
-- Actions that do not request `pool` continue to route to the default worker pool.
-- Actions that request `pool=testcontainers` route only to the DinD fleet.
-- Actions that request `pool=testcontainers-sysbox` route only to the Sysbox fleet.
-
-Buildbarn's default action platform matching is exact: the action's platform
-properties must equal the worker's advertised platform properties. The most
-direct way to route a Testcontainers test is to set `exec_properties` on the
-target:
-
-```starlark
-go_test(
-    name = "integration_test",
-    env = {
-        "DOCKER_HOST": "unix:///var/run/docker.sock",
-        "TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE": "/var/run/docker.sock",
-        "TESTCONTAINERS_HOST_OVERRIDE": "localhost",
-    },
-    exec_properties = {
-        "pool": "testcontainers",
-    },
-    tags = ["requires-docker"],  # informational; not used for routing
-    ...
-)
-```
-
-For Sysbox, use `pool=testcontainers-sysbox` instead.
-
-Both fleets use the same Testcontainers environment variables in the Bazel
-target because Testcontainers should connect to the Docker daemon from inside
-the action container, not to a node-level Docker socket.
-
-If you keep additional worker platform properties such as `container-image`,
-make sure the action requests those properties too, for example via
-`--remote_default_exec_properties`. Do not rely on
-`--modify_execution_info=.*@requires-docker=+pool=testcontainers` for tag-based
-routing; Bazel matches that flag against action mnemonics, not target tags.
+Optional [`RbeWorker` examples](../../custom-values/rbeworkers/README.md#pools)
+provide Docker-in-Docker and Sysbox pools. Apply the appropriate Kustomize
+component after preparing the required runtime and node capacity. Use an
+environment overlay to target Sysbox-capable nodes. The pools advertise
+`pool=testcontainers` and `pool=testcontainers-sysbox`, respectively. The sample
+[`examples/testcontainers/`](../../examples/testcontainers/) workspace shows
+how Bazel targets select a pool and set `DOCKER_HOST`,
+`TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE`, and
+`TESTCONTAINERS_HOST_OVERRIDE` for the action.
 
 ### Node Pool Prerequisites
 
-The chart does not create node pools — provision them out-of-band.
+The chart does not create worker node pools. The example `RbeWorker` manifests
+select only `amd64` Linux nodes and include no custom tolerations. Add any
+node-pool selectors and tolerations in your environment overlay, and confirm
+the nodes have enough resources and scratch storage for the selected pools.
 
-The DinD pool must satisfy:
-
-- Label `workload=testcontainers` (matched by `workerTestcontainers.nodeSelector`)
-- Taint `workload=testcontainers:NoSchedule` (tolerated by `workerTestcontainers.tolerations`)
-- Ubuntu containerd node image — `dind`'s `overlay2` storage driver needs the
-  kernel `overlay` module, which is available on GKE Ubuntu nodes. Container-Optimized
-  OS (`cos_containerd`) is too locked down for the privileged `dind` sidecar.
-- Local SSD mounted at `/mnt/stateful_partition/kube-ephemeral-ssd` for the
-  CAS hostPath (same convention used by `worker-ubuntu22-04`).
-- A machine type with memory headroom for the pod (default Pod limit is 32Gi
-  for the runner alone; plan for ≥64Gi nodes to leave room for two pods plus
-  system overhead).
-
-The Sysbox pool must satisfy:
-
-- Label `workload=testcontainers-sysbox` (matched by `workerTestcontainersSysbox.nodeSelector`)
-- Taint `workload=testcontainers-sysbox:NoSchedule` (tolerated by `workerTestcontainersSysbox.tolerations`)
-- Sysbox installed on every node in the pool.
-- Kubernetes `RuntimeClass` named `sysbox-runc` with handler `sysbox-runc`.
-- Kubernetes user namespaces enabled for Sysbox pods. The chart renders
-  `hostUsers: false` for `workerTestcontainersSysbox` by default.
-- When using Kubernetes 1.33+ with containerd 2, Sysbox v0.7 requires
-  containerd 2.0.5 or newer; GKE 1.33 node images may lag that patch level.
-- A reachable image configured at `images.runnerTestcontainersSysbox.image`.
-- Local SSD mounted at `/mnt/stateful_partition/kube-ephemeral-ssd` for the CAS hostPath.
-
-Useful smoke checks after deploying Sysbox:
-
-```bash
-kubectl get nodes \
-  -l workload=testcontainers-sysbox \
-  -L sysbox-install,sysbox-runtime,workload
-
-kubectl run sysbox-smoke \
-  --image=ubuntu:22.04 \
-  --restart=Never \
-  --overrides='{"spec":{"runtimeClassName":"sysbox-runc","hostUsers":false,"nodeSelector":{"workload":"testcontainers-sysbox"},"tolerations":[{"key":"workload","operator":"Equal","value":"testcontainers-sysbox","effect":"NoSchedule"}],"containers":[{"name":"sysbox-smoke","image":"ubuntu:22.04","command":["sleep","3600"]}]}}'
-
-kubectl -n hermetiq exec -it deploy/worker-testcontainers-sysbox -c runner -- docker info
-```
-
-### Operational notes
-
-- `dind` runs `privileged: true` — required for cgroup, netns, and overlay
-  mount management. The trust boundary is the same as `workerUbuntu2204`,
-  which also runs the worker container privileged for FUSE.
-- Sysbox does not use the DinD sidecar, host Docker socket, or Docker
-  privileged mode. Docker runs inside the Sysbox runner container.
-- Image pulls happen inside the `dind` daemon, not on the node, so the node-
-  level image cache does not warm them. Populate `workerTestcontainers.preloadImages`
-  or `workerTestcontainersSysbox.preloadImages` with frequently used images
-  (e.g. `postgres:16`, `redis:7`) so they are pulled once at pod start.
-  Add a registry mirror to `workerTestcontainers.dind.registryMirrors` for DinD
-  or bake mirror config into the Sysbox runner image.
-- **Future work — node-level image cache DaemonSet.** `preloadImages` pulls
-  into each pod's emptyDir, which dies with the pod; a pod restart (OOM,
-  eviction, KEDA scale-up after scale-down, rolling chart upgrade) re-pulls
-  every image from the registry. A DaemonSet that pulls images on each
-  testcontainers node and writes them as tarballs to a hostPath on Local SSD
-  would let DinD sidecars `docker load` on startup instead of re-pulling —
-  roughly 10× faster pod recovery, plus resilience to registry outages and
-  rate limits. Deferred until a real customer hits the cold-cache pain
-  point; per-pod `preloadImages` is sufficient at small fleet size.
-- These actions will not cache meaningfully in the action cache. The container
-  runtime state is not part of the action digest. Expect ~0% cache-hit rate
-  on this fleet.
-- Ryuk (the Testcontainers reaper) is left enabled by default. If you pre-pull
-  the Ryuk image, include the tag that matches your Testcontainers client
-  versions.
+For the Docker-in-Docker pool, provide nodes that permit its privileged DinD
+container and the configured CAS storage volume. For the Sysbox pool, install
+Sysbox on the nodes, provide the `sysbox-runc` RuntimeClass, and publish the
+runner image described in
+[`examples/sysbox-runner-image/`](../../examples/sysbox-runner-image/README.md).
+The optional manifests contain the exact node selectors, storage paths, and
+resource requests to review before applying them.
 
 ## Action Routing And Catch-All Workers
 
@@ -1871,10 +1667,43 @@ first, naming the list and the required order.
 
 ## Security And Availability Hardening
 
+The standard chart-managed workloads use the Pod Security Standards
+`restricted` securityContext fields and the CIS Kubernetes Benchmark v2.0.1
+recommendations:
+- non-root UID/GID 65534
+- `seccompProfile: RuntimeDefault`
+- `allowPrivilegeEscalation: false` and `privileged: false`
+- `readOnlyRootFilesystem: true`
+- all capabilities dropped
+
+These settings live under `security.pod` and `security.container`. Storage
+keeps its own settings because they depend on `storage.persistence`. HostPath
+storage modes and a hostPath frontend read cache also prevent `restricted`
+admission.
+
+`RbeWorker` pods are configured on their `RbeWorker` resources, and FUSE and
+Docker-in-Docker need privileged containers. Create the `RbeWorker` resources
+in the Buildbarn release namespace: they use its `buildbarn-worker-config`
+ConfigMap, the scheduler's local DNS name, and namespace-scoped queue metrics.
+That namespace must allow privileged worker Pods (for example, with
+`pod-security.kubernetes.io/enforce: privileged`); it cannot enforce Pod
+Security Standards `restricted`. The chart-managed Pods retain their hardened
+security contexts. Use dedicated worker nodes to limit where privileged builds
+run. A separately installed Hermetiq namespace can enforce `restricted`.
+
+On OpenShift, let the `restricted-v2` SCC assign the IDs:
+
+```yaml
+security:
+  pod:
+    runAsUser: null
+    runAsGroup: null
+```
+
 The chart preserves existing Kubernetes defaults unless you opt in. To stop
-application and chart-managed worker pods from receiving default ServiceAccount
-tokens, set a global default and keep JWKS sync enabled only when that feature
-is in use:
+chart-managed application pods from receiving default ServiceAccount tokens,
+set a global default and keep JWKS sync enabled only when that feature is in
+use. Configure operator-managed worker pods on their `RbeWorker` resources:
 
 ```yaml
 serviceAccount:
@@ -1890,12 +1719,15 @@ frontend:
 
 Workloads can override the global setting with their own
 `automountServiceAccountToken` value: `storage`, `frontend`, `scheduler`,
-`browser`, `remoteAsset`, `workerUbuntu2204`, `workerTestcontainers`, and
-`workerTestcontainersSysbox`.
+`browser`, and `remoteAsset`.
 
 PodDisruptionBudgets are disabled by default so single-replica installs and
 node drains keep existing behavior. Enable them after replica counts are high
-enough for the selected availability policy:
+enough for the selected availability policy.
+Every enabled PDB sets `unhealthyPodEvictionPolicy: AlwaysAllow`, allowing
+node drains to evict unready Pods while retaining the budget for healthy Pods.
+
+For example:
 
 ```yaml
 storage:
@@ -1923,20 +1755,14 @@ that bypasses the frontend. The port is never routed externally, so the
 exposure is in-cluster: by default any pod in the cluster can reach it.
 
 `storage.networkPolicy` restricts it to the Buildbarn components plus peers you
-name. It is disabled by default because it has to know where your workers run:
+name. Workers in the Buildbarn namespace are admitted by their `app=worker`
+label. It is disabled by default so you can check any additional clients before
+enabling it:
 
 ```yaml
 storage:
   networkPolicy:
     enabled: true
-    # Operator-managed RbeWorker pods outside the Buildbarn namespace.
-    additionalClientPeers:
-      - podSelector:
-          matchLabels:
-            app.kubernetes.io/name: bb-worker
-        namespaceSelector:
-          matchLabels:
-            kubernetes.io/metadata.name: rbe-workers
     # Peers allowed to scrape metrics on :9980. An empty list allows any
     # source, which suits a scraper that runs in another namespace.
     metricsPeers:
@@ -1951,6 +1777,51 @@ storage directly, and a missing peer surfaces as cache misses and RBE failures
 rather than a clear connection error. The cluster also needs a
 NetworkPolicy-enforcing CNI; without one the policy is accepted and silently
 does nothing.
+
+### Restricting direct scheduler access
+
+The scheduler has the same exposure:
+- Its client gRPC port `:8982` accepts Execute calls without passing through
+  the frontend's authorizers.
+- Anything that reaches worker gRPC `:8983` can register as a worker, receive
+  actions, and report their results.
+
+`scheduler.networkPolicy` admits only these callers, plus any peers you list:
+- the frontend on `:8982`
+- bb-portal on BuildQueueState `:8984`
+- workers in the Buildbarn namespace on `:8983`
+
+```yaml
+scheduler:
+  networkPolicy:
+    enabled: true
+    # The admin web UI on :7982, published by the rbeWeb route, stays open to
+    # any source until you name your ingress controller or Gateway namespace.
+    adminPeers:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: envoy-gateway-system
+```
+
+`additionalClientPeers` adds callers of `:8982` and `:8984`. `metricsPeers`
+narrows `:9980`, as it does for storage. Standard `RbeWorker` pods need no
+`additionalWorkerPeers` entry; keep their `app=worker` label so they can
+register on `:8983`. Reserve additional peers for explicitly trusted custom
+clients of that port.
+
+### Locking down the rest
+
+The storage and scheduler policies cover the ports that carry no
+authentication. To restrict everything else, add your own NetworkPolicies,
+either in the release through `extraObjects` or alongside it.
+- Select chart pods by their `app` label: `frontend`, `browser`, `scheduler`,
+  `storage`, `bb-portal`, or `remote-asset`.
+- Select RbeWorker pods by `app.kubernetes.io/name: bb-worker`.
+- The frontend, Browser, portal, and remote asset service receive traffic from
+  your ingress controller or Gateway.
+
+Once any ingress policy selects a pod, traffic that no policy allows is
+dropped, so list every caller before you enable one.
 
 ## Scheduling
 
@@ -1979,10 +1850,8 @@ frontend:
       operator: Exists
 ```
 
-Operator-managed workers use scheduling fields on their `RbeWorker` custom
-resources. Legacy chart-managed workers use `workerUbuntu2204.nodeSelector` and
-`workerUbuntu2204.tolerations`, because worker scheduling usually targets larger
-or local-SSD nodes. Override these for your cloud provider and node pool.
+Workers use scheduling fields on their `RbeWorker` custom resources. Set node
+selectors and tolerations there for the appropriate cloud provider and node pool.
 
 ## Verification
 
@@ -2003,9 +1872,7 @@ kubectl get sts storage -n hermetiq
 kubectl get rbeworkers.bb.hermetiq.com -n hermetiq
 ```
 
-Legacy chart-managed workers may be `0/0` until KEDA scales them for queued
-work. Operator-managed worker status is reported on the `RbeWorker` custom
-resource.
+Worker status is reported on each `RbeWorker` custom resource.
 
 Check endpoints:
 
@@ -2054,15 +1921,6 @@ DEPLOY=$(kubectl -n hermetiq get rbeworker worker-ubuntu22-04 \
 kubectl -n hermetiq get pods -l "$SELECTOR"
 kubectl -n hermetiq logs deploy/"$DEPLOY" -c worker
 kubectl -n hermetiq logs deploy/"$DEPLOY" -c runner
-```
-
-Inspect legacy chart-managed worker startup issues:
-
-```bash
-kubectl describe pod -l app=worker,instance=ubuntu22-04 -n hermetiq
-kubectl get deploy -l app=worker -n hermetiq
-kubectl logs deploy/worker-ubuntu22-04 -c worker -n hermetiq
-kubectl logs deploy/worker-ubuntu22-04 -c runner -n hermetiq
 ```
 
 Confirm the frontend accepts your JWT and advertises remote execution and

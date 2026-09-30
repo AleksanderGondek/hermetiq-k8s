@@ -41,8 +41,11 @@ images:
     digest: ""
     pullPolicy: IfNotPresent
   oauth2Proxy:
-    repository: quay.io/oauth2-proxy/oauth2-proxy
-    tag: v7.15.1
+    # Mirrored from quay.io/oauth2-proxy/oauth2-proxy into Hermetiq's public
+    # registry so on-prem installs pull every chart image from one place and do
+    # not depend on quay.io. Re-mirror with `crane copy` when bumping the tag.
+    repository: us-docker.pkg.dev/hermetiq-cloud/hermetiq-public/oauth2-proxy
+    tag: v7.15.4
     digest: ""
     pullPolicy: IfNotPresent
 
@@ -51,9 +54,11 @@ bootstrap:
   projectName: build-analytics
   # Defaults to the Helm release namespace. Override when Buildbarn is installed elsewhere.
   projectNamespace: ""
-  # User-facing Buildbarn Browser URL for the managed namespace.
+  # User-facing Buildbarn Browser URL for the managed namespace. Empty defaults
+  # to https://browser.<hosts.domainBase> when domainBase is set.
   namespaceBrowserUrl: ""
-  # User-facing metrics/dashboard URL for the managed namespace.
+  # User-facing overview dashboard URL. Empty defaults to
+  # https://<hosts.grafana or grafana.domainBase>/d/hermetiq-demo.
   namespaceDashboardUrl: ""
   retentionDays: 30
   premake: 30
@@ -177,9 +182,6 @@ license:
   airGapped: false
   # Key inside the Secret holding the air-gap license file.
   licenseFileSecretKey: license.lic
-  # Support escape hatch overriding the derived cluster fingerprint;
-  # 64-character lowercase sha256 hex. Leave empty in normal operation.
-  fingerprintOverride: ""
   # Hermetiq SaaS endpoint used for TRIAL ISSUANCE only (first boot with no
   # key). Periodic license VALIDATION goes directly to https://api.keygen.sh
   # — allow egress to both hosts.
@@ -246,6 +248,8 @@ nats:
     rolloutChecksum: ""
 
 victoriaMetrics:
+  # Empty defaults to the chart-provisioned Grafana overview dashboard URL,
+  # derived from hosts.grafana or hosts.domainBase.
   dashboardUrl: ""
   # Grafana datasource UIDs substituted into the packaged dashboard JSON.
   # Override these when Grafana provisions the datasources under different UIDs.
@@ -826,11 +830,21 @@ gcpWorkloadIdentity:
 
 rbac:
   enabled: true
+  # namespace uses only Roles/RoleBindings, including a read of the release
+  # Namespace UID for licensing. Recreating the namespace changes that UID.
+  # cluster uses a ClusterRole with a namespaced RoleBinding for application
+  # permissions. Licensing still uses the release Namespace UID.
+  mode: namespace
   clusterRoleName: cert-crud
   roleBindingName: cert-crud-binding
+  namespaceRoleName: runtime
+  namespaceRoleBindingName: runtime-binding
   rules:
-    certManager: true
-    secrets: true
+    # Runtime client-certificate management is separate from routing TLS.
+    # It needs cert-manager and Secret access in the certificate namespace;
+    # leave these off unless that application feature is configured.
+    certManager: false
+    secrets: false
     leases: true
     # Read-only Deployments and StatefulSets, for the Buildbarn MCP tools'
     # workload discovery (mounted ConfigMaps, worker pool container images, and
@@ -850,20 +864,17 @@ rbac:
     # than a cluster-scoped `nodes` grant. Disabling it leaves storage health
     # reporting device saturation as unavailable rather than failing.
     pods: true
-    # ClusterRole+ClusterRoleBinding granting `get` on the kube-system
-    # Namespace OBJECT only (resourceNames: [kube-system]) — its UID is the
-    # stable cluster fingerprint for license identity. It cannot list
-    # namespaces and grants nothing INSIDE kube-system (Secrets, ConfigMaps,
-    # and Pods are separate resources with no grant here). Disabling this
-    # falls back to the weaker own-namespace UID fingerprint; licensing
-    # still works.
-    clusterFingerprint: true
     # Namespaced Role letting the app write the single hermetiq-license-state
     # Secret (auto-issued trial key, signed validation cache for offline
     # grace). Write verbs are scoped to that one Secret by resourceNames;
     # create cannot be name-scoped in Kubernetes RBAC.
     licenseState: true
 
+# Applied to every pod and container the chart renders. Together they meet the
+# CIS Kubernetes Benchmark v2.0.1 and Pod Security Standards "restricted";
+# containers also always get privileged: false. Set runAsUser, runAsGroup or
+# fsGroup (here and under dashboard.security) to null to let the platform
+# assign them, e.g. OpenShift's restricted-v2 SCC.
 security:
   pod:
     runAsNonRoot: true
@@ -910,6 +921,7 @@ api:
   resources:
     authProxy:
       requests:
+        cpu: 100m
         memory: 300Mi
       limits:
         cpu: 500m
@@ -1030,8 +1042,8 @@ publisher:
     enabled: true
     url: ""
     issuer: ""
-    # BES/CAL token audience. Comma-separated: a token matching any entry is
-    # accepted.
+    # BES/CAL token audience. Defaults to https://<hosts.bepGrpc> or
+    # https://bep.<hosts.domainBase>. Comma-separated overrides are accepted.
     audience: ""
     groupsClaim: hermetiq/roles
     existingSecret: ""
@@ -1069,6 +1081,7 @@ publisher:
     staticForwardedUser: ""
     resources:
       requests:
+        cpu: 100m
         memory: 300Mi
       limits:
         cpu: 500m
@@ -1146,7 +1159,10 @@ dashboard:
       cpu: 1000m
       memory: 1024Mi
   security:
-    readOnlyRootFilesystem: false
+    # nginx writes only to its html, cache, run and /tmp emptyDirs, so the
+    # image filesystem stays read-only. Set false only for a custom image that
+    # writes elsewhere.
+    readOnlyRootFilesystem: true
     runAsNonRoot: true
     runAsUser: 65532
     runAsGroup: 65532

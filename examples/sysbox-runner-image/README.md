@@ -1,12 +1,12 @@
 # Sysbox Buildbarn runner image
 
-This is an example runner image for the `worker-testcontainers-sysbox` fleet. It
-adapts EngFlow's Sysbox guidance to this chart's Buildbarn runner model: Docker
+This is an example runner image for the `worker-testcontainers-sysbox` RbeWorker
+pool. It adapts EngFlow's Sysbox guidance to the worker operator's runner model: Docker
 runs inside the runner container, the image includes Buildbarn's `bb_runner`,
 and the image entrypoint starts `dockerd` before execing `/bb/bb_runner`.
 
-The Buildbarn chart's normal worker pods install `bb_runner` with a
-`bb-runner-installer` init container. The Sysbox pod intentionally does not:
+The worker operator's regular pods install `bb_runner` with a
+`bb-runner-installer` init container. The Sysbox pod does not:
 `runtimeClassName` applies to every container in the pod, and the runner image
 is the only place that needs `bb_runner`. Baking it into this image keeps the
 Sysbox pod simple and avoids running an extra installer container under the
@@ -20,8 +20,8 @@ docker push <registry>/buildbarn-sysbox-runner:latest
 ```
 
 The Dockerfile copies `bb_runner` out of Buildbarn's runner-installer image at
-build time. Override `RUNNER_INSTALLER_IMAGE` if the chart's
-`images.runnerInstaller` tag changes:
+build time. Override `RUNNER_INSTALLER_IMAGE` if the image used by your
+`RbeWorker` pools changes:
 
 ```bash
 docker build --platform linux/amd64 \
@@ -47,6 +47,11 @@ The Kubernetes node pool must have Sysbox installed, and the cluster must expose
 a `RuntimeClass` named `sysbox-runc`. On Kubernetes 1.33+ with containerd 2,
 Sysbox v0.7 also requires Kubernetes user namespaces (`hostUsers: false`) and
 containerd 2.0.5 or newer.
+
+The `RbeWorker` example does not select Sysbox nodes by label or tolerate
+node-pool taints. Configure scheduling on the RuntimeClass or add a
+`spec.pod.nodeSelector` and matching tolerations in your environment overlay
+before applying it. See [worker pod scheduling](../../custom-values/rbeworkers/README.md#pod-scheduling).
 
 ```yaml
 apiVersion: node.k8s.io/v1

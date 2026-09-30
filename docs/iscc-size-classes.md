@@ -33,7 +33,10 @@ storage:
       enabled: true
 ```
 
-FSAC is currently consumed by the chart's worker Jsonnet prefetching path when a chart-managed worker has `<worker>.config.prefetching.enabled: true` and `virtualBuildDirectory.enabled: true`. The generated `RbeWorker` CRD path exposes size classes and Docker modes, but not a direct prefetching field today, so the examples here focus on the ISCC scheduler path.
+`RbeWorker` pools can use FSAC for input prefetching. Configure
+`spec.config.generated.prefetching` and a virtual build directory on the pool;
+the worker operator reads the FSAC store from the Buildbarn chart's shared
+`common.libsonnet`.
 
 ## 2. Enable Scheduler Analysis
 
@@ -103,7 +106,9 @@ Important details:
 - Do not list `worker-common.libsonnet` under `commonItems`. The operator projects its own copy. `commonItems` defaults to `[common.libsonnet]`, which is what you want.
 - Keep `completedActionLoggerAddress` aligned with the BEP publisher service for your Hermetiq deployment. The value above matches the default `hermetiq` namespace; change it when deploying Hermetiq elsewhere.
 - Use a distinct platform, such as `pool=sizeclass`, so these workers get their own queue. Do not mix default size class `0` workers with positive size classes in the same queue.
-- Give each worker pool its own on-node CAS read-cache path, such as `cas-sizeclass-small` and `cas-sizeclass-large`. Two workers must not share one blocks file.
+- The examples use a separate `emptyDir` CAS cache for each Pod. If you switch
+  to `hostPath` cache storage, ensure two worker Pods on the same node never
+  share a CAS read-cache path or blocks file.
 - If both pools run on the same node type, size classes are nominal. That is fine for testing the ISCC path. Use different machine types when you want the classes to represent real resource differences.
 
 ## Driving It

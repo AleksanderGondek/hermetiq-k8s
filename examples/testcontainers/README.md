@@ -159,11 +159,36 @@ The build's own record is the tiebreaker. Open the invocation in the dashboard
 `--default_override=1:build:rbe=...` in the latter were read from your
 `.bazelrc` but never applied.
 
+## Worker pod scheduling
+
+The optional [`RbeWorker` examples](../../custom-values/rbeworkers/README.md#pod-scheduling)
+select only `amd64` Linux nodes. They have no node-pool selectors or
+tolerations. Before enabling either pool, check that matching nodes have enough
+CPU, memory, and ephemeral storage for the example resource requests, Docker
+image layers, test containers, and the `emptyDir` worker and CAS volumes. KEDA
+scaling a Deployment does not guarantee that its Pods can be scheduled.
+
+- **Docker-in-Docker:** Nodes and Pod policies must permit the privileged DinD
+  container and its configured storage driver. Add a selector and tolerations
+  through your Kustomize overlay if you dedicate or taint nodes for this pool.
+- **Sysbox:** Install Sysbox on the nodes and provide a `sysbox-runc`
+  RuntimeClass. Ensure the RuntimeClass scheduling rules or your overlay select
+  only Sysbox-capable nodes. The example's `runtimeClassName` names the runtime;
+  it does not add a node-pool selector to the `RbeWorker` manifest.
+
+If you change the CAS cache to a `hostPath` volume, ensure two workers on the
+same node cannot share its cache path. See the worker example
+[environment overlay](../../custom-values/rbeworkers/README.md#environment-overlays)
+for a node selector and toleration patch. Check Pending Pods with
+`kubectl describe pod` before debugging Bazel routing or Docker startup.
+
 ## GKE node pool requirements
 
-The Testcontainers worker fleets should land on dedicated GKE node pools. The
-reference GKE setup creates two pools: one for the Docker-in-Docker worker and
-one for the Sysbox worker.
+For a GKE deployment, the Testcontainers worker fleets should land on
+dedicated node pools. The reference setup uses one pool for the
+Docker-in-Docker worker and one for the Sysbox worker. The portable `RbeWorker`
+examples do not include the GKE labels and tolerations below; add the matching
+`spec.pod` settings in your deployment overlay.
 
 For the DinD-backed `worker-testcontainers` `RbeWorker`, create a node pool with:
 
@@ -179,12 +204,14 @@ For the DinD-backed `worker-testcontainers` `RbeWorker`, create a node pool with
 - The node label `workload=testcontainers`.
 - The taint `workload=testcontainers:NoSchedule`.
 
-Those last two fields must match `spec.pod` in
+Add matching fields to `spec.pod` for
 `custom-values/rbeworkers/optional/testcontainers/worker-testcontainers.yaml`:
 
 ```yaml
 pod:
   nodeSelector:
+    kubernetes.io/arch: amd64
+    kubernetes.io/os: linux
     workload: testcontainers
   tolerations:
     - key: workload
@@ -193,8 +220,8 @@ pod:
       effect: NoSchedule
 ```
 
-For the Sysbox-backed `worker-testcontainers-sysbox` `RbeWorker`, create a separate
-node pool with:
+For the Sysbox-backed `worker-testcontainers-sysbox` `RbeWorker`, create a
+separate node pool with:
 
 - GKE image type `UBUNTU_CONTAINERD`.
 - Autoscaling enabled, with `minNodeCount: 1`; keeping one node warm avoids
@@ -210,16 +237,16 @@ node pool with:
 - Sysbox installed on the nodes and a Kubernetes `RuntimeClass` named
   `sysbox-runc`.
 
-The matching `RbeWorker` settings are:
+The Sysbox example already sets `docker.mode: sysbox`,
+`docker.sysbox.runtimeClassName: sysbox-runc`, and
+`docker.sysbox.hostUsers: false`. Add the node selectors and toleration to its
+`spec.pod` through your overlay:
 
 ```yaml
-docker:
-  mode: sysbox
-  sysbox:
-    runtimeClassName: sysbox-runc
-    hostUsers: false
 pod:
   nodeSelector:
+    kubernetes.io/arch: amd64
+    kubernetes.io/os: linux
     workload: testcontainers-sysbox
     sysbox-install: "yes"
   tolerations:

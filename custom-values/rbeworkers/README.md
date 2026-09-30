@@ -1,10 +1,14 @@
 # RBE worker manifests
 
 This directory is a Kustomize base for the standard Ubuntu, Codex, and Envoy
-worker pools. Apply it directly when the starter service addresses are correct:
+worker pools. After copying `custom-values/` to `my-custom-values/` and
+installing Buildbarn, edit the copied manifests for your environment. Apply
+them in the Buildbarn release namespace after the Buildbarn release and
+`buildbarn-worker-config` are ready. The example release namespace is
+`hermetiq`:
 
 ```bash
-kubectl apply --namespace hermetiq --kustomize custom-values/rbeworkers
+kubectl apply --namespace hermetiq --kustomize my-custom-values/rbeworkers
 ```
 
 These manifests require operator 0.3.4 or later, which filters queue-depth
@@ -36,13 +40,42 @@ Optional components under `optional/`:
   first.
 
 Every manifest references the `buildbarn-worker-config` ConfigMap rendered by
-the Buildbarn chart, so apply them after the Buildbarn release is ready. Pools
-that should emit completed-action events must point
+the Buildbarn chart. Pools that should emit completed-action events must point
 `spec.config.generated.completedActionLoggerAddress` at the Hermetiq publisher;
 the starter value `bep-nats-pub.hermetiq.svc.cluster.local:50091` matches
-`bbcal.address` in `custom-values/buildbarn-values.yaml`. Adjust node labels,
-tolerations, platform properties, runner images, and resource sizes to match
-your environment.
+`bbcal.address` in `custom-values/buildbarn-values.yaml`. Adjust platform
+properties and runner images for your workloads.
+
+## Pod scheduling
+
+Review scheduling before applying any pool. KEDA can request worker replicas,
+but those Pods still need nodes that satisfy their resource requests, selectors,
+taints, runtime, and scratch-storage needs.
+
+- The examples select only standard Kubernetes `amd64` Linux node labels. They
+  do not select a cloud provider, node pool, or spot nodes. Use an environment
+  overlay to add `spec.pod.nodeSelector` and `spec.pod.tolerations` for dedicated
+  pools or tainted nodes. Make sure a matching node or node autoscaler can
+  supply the requested CPU and memory; the example resource sizes are large.
+- The CAS scratch volumes use `emptyDir`. Their data is lost when a Pod is
+  removed, and they consume node ephemeral storage alongside image layers and
+  other scratch files. Check available disk capacity and set appropriate
+  ephemeral-storage requests and limits for your cluster. If you use a local
+  disk through `hostPath` instead, patch `spec.storage.casVolume` and ensure
+  concurrently scheduled workers cannot share the same CAS cache path.
+- Docker-in-Docker workers need nodes and Pod policies that permit their
+  privileged Docker container. Sysbox workers need Sysbox installed on the
+  selected nodes and the `sysbox-runc` RuntimeClass. Configure RuntimeClass
+  scheduling or an overlay so Sysbox Pods cannot land on nodes without Sysbox.
+
+Before running builds, check that the worker Pods reached their intended nodes.
+For a Pending Pod, `kubectl describe` shows scheduling failures such as missing
+labels, untolerated taints, or insufficient CPU, memory, and ephemeral storage:
+
+```bash
+kubectl -n hermetiq get pods -l app=worker -o wide
+kubectl -n hermetiq describe pod <pending-worker-pod>
+```
 
 FUSE-backed pools get `spec.storage.fuse.cleanupOnTermination: true` by default.
 The worker operator renders a Kubernetes-native sidecar that terminates after
@@ -54,8 +87,9 @@ and Kubernetes 1.29 or newer.
 
 ## Environment overlays
 
-For another environment, reference this directory from a Kustomize overlay and
-patch the environment-specific values without copying the worker manifests:
+For another environment, reference this directory from a Kustomize overlay.
+Set its namespace to the Buildbarn release namespace and patch the
+environment-specific values without copying the worker manifests:
 
 ```yaml
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -87,11 +121,22 @@ patches:
       - op: replace
         path: /spec/autoscaling/minReplicas
         value: 2
+      - op: add
+        path: /spec/pod/nodeSelector/node-type
+        value: spot-std-large
+      - op: add
+        path: /spec/pod/tolerations
+        value:
+          - key: hermetiq/allows-spot
+            operator: Exists
+            effect: NoSchedule
 ```
 
 The JSON Patch `replace` operations intentionally fail if a future manifest no
 longer contains one of these fields, preventing an overlay from silently
-leaving a worker pointed at the starter environment.
+leaving a worker pointed at the starter environment. The node selector and
+toleration above are examples for one pool; replace them with your own node
+labels and taints.
 
 The size-class, Testcontainers, and Drake manifests are intentionally excluded
 from the standard bundle. Apply them only after satisfying the scheduler,
@@ -117,4 +162,43 @@ components:
 
 The overlay's namespace and `RbeWorker` patch apply to component resources too,
 so the optional workers receive the same environment-specific addresses as the
-standard bundle. Generated queue-depth queries filter by each worker's namespace.
+standard bundle. Set the overlay namespace to the Buildbarn release namespace:
+generated queue-depth queries filter by each worker's namespace, and the
+operator reads `buildbarn-worker-config` there.
+
+## Pod security
+
+Worker pods can't meet Pod Security Standards `restricted`, because the FUSE
+build directory needs privileged containers:
+- The `worker` container runs privileged as root.
+- The operator's `fuse-cleanup` sidecar runs privileged as root.
+- Docker-in-Docker pools also run `dind` privileged.
+
+Run the pools in the same namespace as Buildbarn. That namespace must permit
+privileged worker Pods, for example with
+`pod-security.kubernetes.io/enforce: privileged`; it cannot enforce
+`restricted`. Give the pools dedicated nodes. The Buildbarn chart's storage
+and scheduler NetworkPolicies already admit same-namespace `app=worker` Pods,
+so these examples need no additional peer entries.
+
+Everything else is hardened:
+- **Operator-owned containers:** the runner installer runs non-root and
+  read-only. `volume-init` runs as root with only `DAC_OVERRIDE` and `FOWNER`.
+- **ServiceAccount token:** the operator mounts none unless
+  `spec.pod.automountServiceAccountToken` is `true`. Build actions therefore
+  can't read Kubernetes credentials.
+- **Runners in these examples:** they run as a non-root user with no privilege
+  escalation and no capabilities.
+
+For regulated environments, the runner can also take the settings below. Test
+them against your builds first, since they change the actions' primary group
+and block some syscalls:
+
+```yaml
+spec:
+  runner:
+    securityContext:
+      runAsGroup: 65534
+      seccompProfile:
+        type: RuntimeDefault
+```

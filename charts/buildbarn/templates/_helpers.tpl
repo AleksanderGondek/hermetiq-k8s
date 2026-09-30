@@ -132,36 +132,51 @@ affinity:
 {{- end -}}
 {{- join "\n---\n" $parts | sha256sum -}}
 {{- end -}}
-{{- define "buildbarn.workerConfigChecksum" -}}
-{{- $root := .root -}}
-{{- $configOverrides := default dict $root.Values.configOverrides -}}
-{{- $workerOverrides := default dict $root.Values.workerConfigOverrides -}}
-{{- $parts := list -}}
-{{- range $name := .files -}}
-  {{- if eq $name "common.libsonnet" -}}
-    {{- $override := index $configOverrides $name | default "" -}}
-    {{- if $override -}}
-      {{- $parts = append $parts (printf "%s:%s" $name $override) -}}
-    {{- else -}}
-      {{- $parts = append $parts (printf "%s:%s" $name (tpl ($root.Files.Get "files/config/common.libsonnet") $root)) -}}
-    {{- end -}}
-  {{- else -}}
-    {{- $override := index $workerOverrides $name | default "" -}}
-    {{- if $override -}}
-      {{- $parts = append $parts (printf "%s:%s" $name $override) -}}
-    {{- else -}}
-      {{- $parts = append $parts (printf "%s:%s" $name (tpl ($root.Files.Get (printf "files/worker-config/%s" $name)) $root)) -}}
-    {{- end -}}
-  {{- end -}}
-{{- end -}}
-{{- join "\n---\n" $parts | sha256sum -}}
-{{- end -}}
 {{- define "buildbarn.oauth2ProxyConfigName" -}}
 {{- if .Values.browser.oauth2Proxy.existingConfigMap -}}
 {{- .Values.browser.oauth2Proxy.existingConfigMap -}}
 {{- else -}}
 oauth2-proxy-config-browser
 {{- end -}}
+{{- end -}}
+{{- define "buildbarn.oauth2ProxyConfigData" -}}
+OAUTH2_PROXY_AUTH_LOGGING: "true"
+OAUTH2_PROXY_COOKIE_HTTPONLY: "true"
+OAUTH2_PROXY_COOKIE_SAMESITE: lax
+OAUTH2_PROXY_COOKIE_SECURE: {{ .Values.browser.oauth2Proxy.cookieSecure | quote }}
+OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+OAUTH2_PROXY_HTTP_ADDRESS: "0.0.0.0:8888"
+OAUTH2_PROXY_INSECURE_OIDC_ALLOW_UNVERIFIED_EMAIL: {{ .Values.browser.oauth2Proxy.insecureOidcAllowUnverifiedEmail | quote }}
+OAUTH2_PROXY_INSECURE_OIDC_SKIP_ISSUER_VERIFICATION: {{ .Values.browser.oauth2Proxy.insecureOidcSkipIssuerVerification | quote }}
+OAUTH2_PROXY_OIDC_GROUPS_CLAIM: {{ .Values.browser.oauth2Proxy.oidcGroupsClaim | quote }}
+OAUTH2_PROXY_OIDC_ISSUER_URL: {{ required "browser.oauth2Proxy.oidcIssuerUrl is required when oauth2Proxy is enabled" .Values.browser.oauth2Proxy.oidcIssuerUrl | quote }}
+OAUTH2_PROXY_PASS_ACCESS_TOKEN: "true"
+OAUTH2_PROXY_PASS_AUTHORIZATION_HEADER: "true"
+OAUTH2_PROXY_PASS_USER_HEADERS: {{ .Values.browser.oauth2Proxy.passUserHeaders | quote }}
+OAUTH2_PROXY_PROVIDER: {{ .Values.browser.oauth2Proxy.provider | quote }}
+OAUTH2_PROXY_REAL_CLIENT_IP_HEADER: X-Forwarded-For
+OAUTH2_PROXY_REQUEST_LOGGING: "true"
+OAUTH2_PROXY_REVERSE_PROXY: "true"
+OAUTH2_PROXY_SCOPE: {{ .Values.browser.oauth2Proxy.scope | quote }}
+OAUTH2_PROXY_SET_XAUTHREQUEST: {{ .Values.browser.oauth2Proxy.setXAuthRequest | quote }}
+OAUTH2_PROXY_SESSION_COOKIE_MINIMAL: {{ .Values.browser.oauth2Proxy.sessionCookieMinimal | quote }}
+OAUTH2_PROXY_SHOW_DEBUG_ON_ERROR: {{ .Values.browser.oauth2Proxy.showDebugOnError | quote }}
+OAUTH2_PROXY_SILENCE_PING_LOGGING: "true"
+OAUTH2_PROXY_SKIP_AUTH_PREFLIGHT: {{ .Values.browser.oauth2Proxy.skipAuthPreflight | quote }}
+OAUTH2_PROXY_SKIP_JWT_BEARER_TOKENS: {{ .Values.browser.oauth2Proxy.skipJwtBearerTokens | quote }}
+OAUTH2_PROXY_SKIP_OIDC_DISCOVERY: {{ .Values.browser.oauth2Proxy.skipOidcDiscovery | quote }}
+OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: {{ .Values.browser.oauth2Proxy.skipProviderButton | quote }}
+OAUTH2_PROXY_SSL_INSECURE_SKIP_VERIFY: {{ .Values.browser.oauth2Proxy.sslInsecureSkipVerify | quote }}
+OAUTH2_PROXY_STANDARD_LOGGING: "true"
+{{- if .Values.browser.oauth2Proxy.cookieDomains }}
+OAUTH2_PROXY_COOKIE_DOMAINS: {{ join "," .Values.browser.oauth2Proxy.cookieDomains | quote }}
+{{- end }}
+{{- if .Values.browser.oauth2Proxy.backendLogoutUrl }}
+OAUTH2_PROXY_BACKEND_LOGOUT_URL: {{ .Values.browser.oauth2Proxy.backendLogoutUrl | quote }}
+{{- end }}
+{{- if .Values.browser.oauth2Proxy.validateUrl }}
+OAUTH2_PROXY_VALIDATE_URL: {{ .Values.browser.oauth2Proxy.validateUrl | quote }}
+{{- end }}
 {{- end -}}
 {{- define "buildbarn.oauth2ProxySecretName" -}}
 {{- default "oauth2-proxy-client" .Values.browser.oauth2Proxy.client.existingSecret -}}
@@ -327,6 +342,50 @@ tolerations:
 {{- end -}}
 {{- if kindIs "bool" $value }}
 automountServiceAccountToken: {{ $value }}
+{{- end }}
+{{- end -}}
+
+{{/* Pod securityContext for every workload except storage, which renders
+     buildbarn.storage.podSecurityContext. Column 0, key included. With the
+     container helper below it carries the full CIS Kubernetes Benchmark / PSS
+     "restricted" set explicitly. A runAsUser, runAsGroup or fsGroup that is
+     null or unset is omitted so the platform can assign it (OpenShift's
+     restricted-v2 SCC picks a UID from the namespace range). */}}
+{{- define "buildbarn.podSecurityContext" -}}
+{{- $pod := .Values.security.pod -}}
+securityContext:
+  runAsNonRoot: {{ $pod.runAsNonRoot }}
+  {{- if not (kindIs "invalid" $pod.runAsUser) }}
+  runAsUser: {{ $pod.runAsUser }}
+  {{- end }}
+  {{- if not (kindIs "invalid" $pod.runAsGroup) }}
+  runAsGroup: {{ $pod.runAsGroup }}
+  {{- end }}
+  {{- if not (kindIs "invalid" $pod.fsGroup) }}
+  fsGroup: {{ $pod.fsGroup }}
+  {{- end }}
+  seccompProfile:
+    type: {{ $pod.seccompProfile.type }}
+{{- end -}}
+
+{{/* Container securityContext body (no key) for the same workloads. */}}
+{{- define "buildbarn.containerSecurityContext" -}}
+{{- $pod := .Values.security.pod -}}
+{{- $container := .Values.security.container -}}
+allowPrivilegeEscalation: {{ $container.allowPrivilegeEscalation }}
+privileged: false
+readOnlyRootFilesystem: {{ $container.readOnlyRootFilesystem }}
+runAsNonRoot: {{ $pod.runAsNonRoot }}
+{{- if not (kindIs "invalid" $pod.runAsUser) }}
+runAsUser: {{ $pod.runAsUser }}
+{{- end }}
+{{- if not (kindIs "invalid" $pod.runAsGroup) }}
+runAsGroup: {{ $pod.runAsGroup }}
+{{- end }}
+{{- with $container.dropCapabilities }}
+capabilities:
+  drop:
+    {{- toYaml . | nindent 4 }}
 {{- end }}
 {{- end -}}
 
@@ -578,6 +637,7 @@ mode runs unprivileged as the storage uid.
 {{- define "buildbarn.storage.volumeInitSecurityContext" -}}
 {{- if eq .Values.storage.persistence.mode "hostPath" }}
 allowPrivilegeEscalation: false
+privileged: false
 readOnlyRootFilesystem: true
 runAsNonRoot: false
 runAsUser: 0
@@ -590,6 +650,7 @@ capabilities:
     - DAC_OVERRIDE
 {{- else }}
 allowPrivilegeEscalation: false
+privileged: false
 readOnlyRootFilesystem: true
 runAsNonRoot: true
 runAsUser: 65534
@@ -683,6 +744,8 @@ securityContext:
           chmod 0600 "$dev"
         fi
       done
+  resources:
+    {{- toYaml .Values.storage.initResources | nindent 4 }}
   {{- if $bd.deviceInit.securityContext }}
   securityContext:
     {{- toYaml $bd.deviceInit.securityContext | nindent 4 }}
@@ -699,9 +762,7 @@ securityContext:
         - CHOWN
         - FOWNER
         - DAC_OVERRIDE
-    {{- if $bd.deviceInit.privileged }}
-    privileged: true
-    {{- end }}
+    privileged: {{ $bd.deviceInit.privileged }}
   {{- end }}
   {{- if eq .Values.storage.persistence.mode "hostPath" }}
   volumeMounts:

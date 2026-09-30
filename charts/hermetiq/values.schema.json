@@ -265,10 +265,6 @@
           "minLength": 1,
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
         },
-        "fingerprintOverride": {
-          "type": "string",
-          "pattern": "^$|^[a-f0-9]{64}$"
-        },
         "saasUrl": {
           "type": "string"
         }
@@ -594,13 +590,14 @@
     "rbac": {
       "type": "object",
       "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["cluster", "namespace"]
+        },
         "rules": {
           "type": "object",
           "properties": {
             "rbeWorkers": {
-              "type": "boolean"
-            },
-            "clusterFingerprint": {
               "type": "boolean"
             },
             "licenseState": {
@@ -708,7 +705,8 @@
               "type": "string"
             },
             "audience": {
-              "type": "string"
+              "type": "string",
+              "description": "BES/CAL token audience. Defaults to the public BEP gRPC origin derived from hosts.bepGrpc or hosts.domainBase."
             },
             "groupsClaim": {
               "type": "string"

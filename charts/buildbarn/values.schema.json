@@ -13,7 +13,6 @@
     "standardLabels": { "type": "object" },
     "serviceAccount": { "type": "object" },
     "configOverrides": { "type": "object" },
-    "workerConfigOverrides": { "type": "object" },
     "images": { "type": "object" },
     "secrets": { "type": "object" },
     "hosts": { "type": "object" },
@@ -22,6 +21,24 @@
     "security": {
       "type": "object",
       "properties": {
+        "pod": {
+          "type": "object",
+          "properties": {
+            "runAsNonRoot": { "type": "boolean" },
+            "runAsUser": { "type": ["integer", "null"] },
+            "runAsGroup": { "type": ["integer", "null"] },
+            "fsGroup": { "type": ["integer", "null"] },
+            "seccompProfile": { "type": "object" }
+          }
+        },
+        "container": {
+          "type": "object",
+          "properties": {
+            "readOnlyRootFilesystem": { "type": "boolean" },
+            "allowPrivilegeEscalation": { "type": "boolean" },
+            "dropCapabilities": { "type": "array", "items": { "type": "string" } }
+          }
+        },
         "grpcMtls": {
           "type": "object",
           "properties": {
@@ -143,9 +160,6 @@
     "browser": { "type": "object" },
     "remoteAsset": { "type": "object" },
     "portal": { "type": "object" },
-    "workerUbuntu2204": { "type": "object" },
-    "workerTestcontainers": { "type": "object" },
-    "workerTestcontainersSysbox": { "type": "object" },
     "keda": { "type": "object" },
     "certificate": { "type": "object" },
     "tls": { "type": "object" },

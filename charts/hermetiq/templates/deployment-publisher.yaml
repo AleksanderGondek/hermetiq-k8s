@@ -36,6 +36,21 @@ spec:
         kubectl.kubernetes.io/default-container: bep-nats
         hermetiq.com/runtime-config-checksum: {{ include "hermetiq-core.natsStreamConfigChecksum" . }}
         hermetiq.com/shared-env-checksum: {{ include "hermetiq-core.sharedEnvChecksum" . }}
+        {{- if not .Values.postgres.password.existingSecret }}
+        checksum/postgres-secret: {{ dict "key" .Values.postgres.password.existingSecretKey "value" .Values.postgres.password.value | toJson | sha256sum }}
+        {{- end }}
+        {{- if not .Values.redis.password.existingSecret }}
+        checksum/redis-secret: {{ dict "key" .Values.redis.password.existingSecretKey "value" .Values.redis.password.value | toJson | sha256sum }}
+        {{- end }}
+        {{- if and .Values.slack.botToken.value (not .Values.slack.botToken.existingSecret) }}
+        checksum/slack-secret: {{ dict "key" .Values.slack.botToken.existingSecretKey "value" .Values.slack.botToken.value | toJson | sha256sum }}
+        {{- end }}
+        {{- if and .Values.license.key.value (not .Values.license.key.existingSecret) }}
+        checksum/license-secret: {{ dict "key" .Values.license.key.existingSecretKey "value" .Values.license.key.value | toJson | sha256sum }}
+        {{- end }}
+        {{- if and .Values.publisher.jwks.enabled (not (include "hermetiq-core.publisherJwksUrl" .)) (not .Values.publisher.jwks.existingSecret) }}
+        checksum/publisher-jwks-secret: {{ .Values.publisher.jwks.json | sha256sum }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "hermetiq-core.serviceAccountName" . }}
       {{- include "hermetiq-core.automountServiceAccountToken" .Values.publisher | nindent 6 }}
@@ -257,10 +272,10 @@ spec:
             - name: GRPC_AUTH_ISSUER
               value: {{ . | quote }}
             {{- end }}
-            {{- if .Values.publisher.jwks.audience }}
+            {{- with (include "hermetiq-core.publisherJwksAudience" .) }}
             # Comma-separated; a token matching any entry is accepted.
             - name: GRPC_AUTH_AUDIENCE
-              value: {{ .Values.publisher.jwks.audience | quote }}
+              value: {{ . | quote }}
             {{- end }}
             {{- end }}
             # Admin resolution is split across two consumers: GRPC_AUTH_* is
@@ -299,10 +314,6 @@ spec:
               value: {{ .Values.license.saasUrl | quote }}
             - name: LICENSE_STATE_SECRET_NAME
               value: {{ include "hermetiq-core.licenseStateSecretName" . | quote }}
-            {{- if .Values.license.fingerprintOverride }}
-            - name: LICENSE_FINGERPRINT_OVERRIDE
-              value: {{ .Values.license.fingerprintOverride | quote }}
-            {{- end }}
             # Paths track the Secret key names (no items: remapping on the
             # volume). LICENSE_LIC_FILE is set unconditionally; the app only
             # reads it in airgap mode.
