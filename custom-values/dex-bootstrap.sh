@@ -115,6 +115,7 @@ storage:
     inCluster: true
 oauth2:
   skipApprovalScreen: true
+  passwordConnector: local
 enablePasswordDB: true
 signer:
   type: local
