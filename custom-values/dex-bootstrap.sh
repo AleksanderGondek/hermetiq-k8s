@@ -116,6 +116,10 @@ storage:
 oauth2:
   skipApprovalScreen: true
 enablePasswordDB: true
+signer:
+  type: local
+  config:
+    keysRotationPeriod: "8760h"
 staticClients:
   - id: hermetiq-web
     name: Hermetiq test installation
